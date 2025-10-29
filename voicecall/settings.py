@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-wb!*#qws^&oe7rk(+1-d*ka3+_8&@up76)l-iu$8@eea69-n=f
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['localhost','f3b624548f84.ngrok-free.app']
+ALLOWED_HOSTS = ['localhost','5f747c0fdcba.ngrok-free.app','127.0.0.1','*']
 
 
 # Application definition
@@ -43,6 +43,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -116,8 +117,11 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
-
+STATIC_URL = '/static/'
+STATICFILES_DIRS = [
+        os.path.join(BASE_DIR, "static"),
+    ]
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
@@ -131,11 +135,12 @@ CHANNEL_LAYERS = {
     }
 }
 
-STATIC_URL = '/static/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 MEDIA_URL = '/media/'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # Twilio settings (fill with env vars in production)
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', 'your_account_sid')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', 'your_auth_token')
 TWILIO_NUMBER = os.environ.get('TWILIO_NUMBER', '+1XXXXXXXXXX')
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'localhost')

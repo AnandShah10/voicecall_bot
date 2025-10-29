@@ -5,11 +5,11 @@ from django.shortcuts import redirect
 from django.conf import settings
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
-
+from urllib.parse import urlencode
 TWILIO_SID = settings.TWILIO_ACCOUNT_SID
 TWILIO_TOKEN = settings.TWILIO_AUTH_TOKEN
 TWILIO_FROM = settings.TWILIO_NUMBER
-
+PUBLIC_URL = settings.PUBLIC_URL
 client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 @csrf_exempt
@@ -36,9 +36,8 @@ def make_outbound_call(request):
 @csrf_exempt
 def inbound_call(request):
     """Handles inbound call and connects caller to WebSocket stream."""
-    call_sid = request.POST.get('CallSid', 'unknown')
+    call_sid = request.POST.get('CallSid', '')
     stream_url = request.build_absolute_uri(f'/ws/twilio/{call_sid}/').replace('http', 'ws')
-    # stream_url = request.build_absolute_uri('ws/twilio/inbound/').replace('http', 'ws')
     vr = VoiceResponse()
     connect = Connect()
     connect.append(Stream(url=stream_url))
@@ -53,10 +52,10 @@ def twiml_response(request, call_id):
     Twilio will send JSON messages (connected, start, media...) and accept JSON messages from us to play audio back.
     """
     # Twilio will pass CallSid in the POST if we need it
-    call_sid = request.POST.get('CallSid', 'unknown')
+    call_sid = request.POST.get('CallSid', '')
     # Build our stream ws url
     # Twilio requires a wss endpoint publically reachable
-    stream_url = request.build_absolute_uri(f'ws/twilio/{call_sid}/').replace('http', 'ws')
+    stream_url = f'{PUBLIC_URL}/ws/twilio/{call_sid}/'.replace('http', 'ws')
     vr = VoiceResponse()
     connect = Connect()
     connect.append(Stream(url=stream_url))

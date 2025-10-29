@@ -1,222 +1,319 @@
-import json
-import base64
-import asyncio
-import os
-import queue
+import json,os,io,time,asyncio,base64,math
 from channels.generic.websocket import AsyncWebsocketConsumer
-from vosk import Model, KaldiRecognizer
+import numpy as np
 import soundfile as sf
 from gtts import gTTS
-# from pydub import AudioSegment
-import io
-from openai import AzureOpenAI
+from openai import OpenAI
 from dotenv import load_dotenv
+from .rag import search_similar_docs
+import librosa
+from scipy.signal import resample_poly
+
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
+
 load_dotenv()
-endpoint = os.getenv("ENDPOINT_URL", "https://jivihireopenai.openai.azure.com/")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # # # Initialize Azure OpenAI Service client with key-based authentication
-client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=os.getenv('OPENAI_API_KEY'),
-        api_version="2024-05-01-preview",
-    )
-# Initialize VOSK model once (download a model and give path)
-VOSK_MODEL_PATH = os.environ.get('VOSK_MODEL_PATH', '/path/to/vosk-model-small-en-us-0.15')
-if not os.path.exists(VOSK_MODEL_PATH):
-    print("Warning: VOSK model path not found. Real ASR won't work until you set VOSK_MODEL_PATH correctly.")
-else:
-    vosk_model = Model(VOSK_MODEL_PATH)
+whisper_model = None
+if WhisperModel:
+    try:
+        # choose "tiny" or "small" by tradeoff (tiny = faster)
+        whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        print("✅ faster-whisper model loaded (tiny)")
+    except Exception as e:
+        print("⚠️ faster-whisper load failed:", e)
 
-# helper: convert raw 16-bit base64 frames from Twilio to PCM numpy or feed to VOSK
-# Twilio sends audio as base64-encoded PCM16 samples at 8kHz (single-channel) — this matches many telephony flows.
-# We'll feed them to VOSK recognizer (which expects 16k or 8k depending on model).
-# We'll accumulate frames into recognizer until final result.
+# --- TUNABLE PARAMETERS ---
+SAMPLE_RATE = 8000               # incoming Twilio audio (usually 8000 Hz)
+BYTES_PER_SEC = SAMPLE_RATE * 2  # PCM16LE, mono
+PROCESS_CHUNK_SEC = 1.0          # process every ~0.6s chunk for partials
+CHUNK_OVERLAP_SEC = 0.2          # overlap window to avoid chopping words
+PROCESS_CHUNK_BYTES = int(PROCESS_CHUNK_SEC * BYTES_PER_SEC)
+CHUNK_OVERLAP_BYTES = int(CHUNK_OVERLAP_SEC * BYTES_PER_SEC)
+SILENCE_THRESHOLD = 100          # RMS threshold for voice detection; tune for your audio
+SPEECH_TIMEOUT = 1.2             # seconds of silence -> finalize utterance
+MIN_UTTERANCE_SEC = int(SAMPLE_RATE * 0.15 * 2)
 
-def pcm16_bytes_to_wav_bytes(pcm_bytes, sample_rate=8000):
-    """Wrap raw PCM16 bytes into a WAV in memory (for pydub or other libs)."""
-    buf = io.BytesIO()
-    sf.write(buf, sf.blocks_to_array([pcm_bytes]), samplerate=sample_rate, format='WAV', subtype='PCM_16')
-    return buf.getvalue()
+def resample_audio_float32(float_audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """
+    Resample a 1-D float32 numpy array from orig_sr -> target_sr using resample_poly.
+    Returns float32 array.
+    """
+    if orig_sr == target_sr:
+        return float_audio
+    # compute integer up/down factors as small integers
+    # up/down = target_sr / orig_sr simplified by gcd
+    up = target_sr
+    down = orig_sr
+    g = math.gcd(up, down)
+    up //= g
+    down //= g
+    # resample_poly expects float input
+    res = resample_poly(float_audio, up, down)
+    return res.astype(np.float32)
+
+def pcm16_to_int16_arr(pcm_bytes):
+    return np.frombuffer(pcm_bytes, dtype=np.int16)
+
+def int16_to_float32(arr):
+    return arr.astype(np.float32) / 32768.0
 
 class TwilioMediaConsumer(AsyncWebsocketConsumer):
-    """
-    Handles Twilio Media Streams WebSocket messages.
-    Twilio sends JSON messages; important types: 'connected', 'start','media','stop'.
-    We will send messages back to Twilio to play audio:
-      {"event":"media","media":{"payload":"<base64_audio_frame>"}}
-    The payload must be raw PCM16 bytes at 8000 Hz encoded base64.
-    """
-
     async def connect(self):
         await self.accept()
         self.call_sid = None
-        # Create a VOSK recognizer stream per connection if model exists
-        self.recognizer = None
-        self.buffer_queue = asyncio.Queue()
-        self.processing_task = None
-        print("WebSocket: accepted connection")
+        self.stream_sid = None
+        self.sample_rate = SAMPLE_RATE
+        # self.recognizer = None           # for VOSK incremental if used
+        self._buffer = bytearray()       # rolling buffer of recent raw PCM bytes
+        self._last_voice_time = 0.0
+        self._last_partial_text = ""
+        self._last_partial_ts = 0.0
+        self._transcribe_lock = asyncio.Lock()
+        self.buffer_queue = asyncio.Queue()   # for final ASR -> AI processing
+        self._process_task = asyncio.create_task(self.process_queue())
+        print("WebSocket accepted")
 
     async def disconnect(self, close_code):
-        if self.processing_task:
-            self.processing_task.cancel()
+        if self._process_task:
+            self._process_task.cancel()
+        self._buffer.clear()
         print("WebSocket disconnected", close_code)
 
     async def receive(self, text_data=None, bytes_data=None):
-        # Twilio sends JSON text messages
         if bytes_data:
-            print("Got binary; ignoring for now")
+            return
+        try:
+            data = json.loads(text_data)
+        except Exception as e:
+            print("Invalid JSON:", e)
             return
 
-        data = json.loads(text_data)
-        event = data.get('event')
-        if event == 'connected':
-            # Twilio connected; can inspect for callSid
-            print("Twilio connected message", data)
-            # No action needed
+        event = data.get("event")
+        if event == "connected":
+            print("Twilio connected.")
             return
 
-        if event == 'start':
-            # Start event contains sampleRate, callSid etc.
-            start = data.get('start', {})
-            self.call_sid = start.get('callSid') or start.get('call_sid') or 'unknown'
-            sample_rate = start.get('sample_rate', 8000)
-            print("Stream start - CallSid:", self.call_sid, "sample_rate:", sample_rate)
-            # initialize VOSK recognizer
-            if 'vosk_model' in globals() and 'vosk_model' in globals() and os.path.exists(VOSK_MODEL_PATH):
-                # VOSK expects sample rate matching the model; use 8000 if provided
-                self.recognizer = KaldiRecognizer(vosk_model, sample_rate)
-                print("VOSK recognizer initialized with sample_rate", sample_rate)
-            # start a background processing task that will handle responses (optional)
-            self.processing_task = asyncio.create_task(self.process_queue())
-            return
+        if event == "start":
+            start = data.get("start", {})
+            self.call_sid = start.get("callSid") or start.get("call_sid") or self.call_sid
+            self.stream_sid = start.get("streamSid") or start.get("stream_sid") or self.stream_sid
+            self.sample_rate = start.get("sample_rate", SAMPLE_RATE)
+            print(f"Stream start - CallSid={self.call_sid} sample_rate={self.sample_rate}")
+            try:
+                await self.stream_tts_to_twilio("Hello, How can i help you?.")
+            except Exception as e:
+                print("Welcome message error:",e)
 
-        if event == 'media':
-            print("In media...........................")
-            media = data.get('media', {})
-            print(media)
-            payload_b64 = media.get('payload')
+        if event == "media":
+            media = data.get("media", {})
+            payload_b64 = media.get("payload")
             if not payload_b64:
                 return
-            # Twilio media payload is base64 of raw PCM16LE audio samples
-            pcm = base64.b64decode(payload_b64)
-            print(pcm)
-            # For demo: feed bytes to recognizer if exists
-            if self.recognizer:
-                ok = self.recognizer.AcceptWaveform(pcm)
-                if ok:
-                    result = json.loads(self.recognizer.Result())
-                    text = result.get('text', '')
-                    print(text,"tttttttttttttttttttttttttt")
-                    if text.strip():
-                        print("ASR final:", text)
-                        # push recognized text to processing queue
-                        await self.buffer_queue.put({'type': 'asr_final', 'text': text})
+            try:
+                pcm = base64.b64decode(payload_b64)
+            except Exception as e:
+                print("Base64 conversion Error.")
+            if not pcm:
+                print("Empty PCM data received")
+                return
+
+            # --- faster-whisper incremental path (rolling buffer + partials) ---
+            # compute RMS of incoming chunk
+            try:
+                arr = pcm16_to_int16_arr(pcm)
+                rms = int(np.sqrt(np.mean(arr.astype(np.float32) ** 2))) if arr.size > 0 else 0
+            except Exception:
+                rms = 0
+
+            now = time.time()
+            if rms >= SILENCE_THRESHOLD:
+                self._last_voice_time = now
+
+            # append to buffer
+            self._buffer += pcm
+
+            # if buffer reached processing threshold -> create sliding window and transcribe partial
+            if len(self._buffer) >= PROCESS_CHUNK_BYTES:
+                # window includes overlap for smoother partials
+                start_idx = max(0, len(self._buffer) - PROCESS_CHUNK_BYTES - CHUNK_OVERLAP_BYTES)
+                window = bytes(self._buffer[start_idx:])
+                # only launch transcription if not already running
+                if not self._transcribe_lock.locked():
+                    print("not loked.........................")
+                    asyncio.create_task(self._transcribe_partial(window))
+                # cap buffer growth (keep last ~4s)
+                max_keep = int(BYTES_PER_SEC * 4)
+                if len(self._buffer) > max_keep:
+                    self._buffer = bytearray(self._buffer[-max_keep:])
+            print(now-self._last_voice_time,"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT")
+            # finalize utterance if silence for SPEECH_TIMEOUT
+            min_buffer_size = int(SAMPLE_RATE * 0.5 * 2) 
+            if (now - self._last_voice_time) > SPEECH_TIMEOUT and len(self._buffer) > min_buffer_size:
+                buf_copy = bytes(self._buffer)
+                self._buffer = bytearray()
+                self._last_voice_time = now
+                asyncio.create_task(self._transcribe_final_and_queue(buf_copy))
+            return
+
+        if event == "stop":
+            print("Stream stop event")
+            # finalize any remaining audio
+            if len(self._buffer) > 0:
+                buf_copy = bytes(self._buffer)
+                self._buffer = bytearray()
+                asyncio.create_task(self._transcribe_final_and_queue(buf_copy))
+            return
+
+    async def _transcribe_partial(self, pcm_bytes: bytes):
+        """Transcribe a sliding window and send an `asr_partial`."""
+        async with self._transcribe_lock:
+            try:
+                if len(pcm_bytes) < int(SAMPLE_RATE * 0.3 * 2):
+                    print("⚠️ PCM chunk too small for transcription")
+                    return
+                int16 = pcm16_to_int16_arr(pcm_bytes)
+                float_audio = int16_to_float32(int16)
+                if self.sample_rate != 16000:
+                    # float_audio = await asyncio.to_thread(librosa.resample, float_audio, self.sample_rate, 16000)
+                    float_audio = await asyncio.to_thread(resample_audio_float32, float_audio, self.sample_rate, 16000)
+                def run_whisper(audio_arr):
+                    segments, _ = whisper_model.transcribe(audio_arr, language="en", beam_size=3)
+                    return " ".join([seg.text for seg in segments]).strip()
+
+                text = await asyncio.to_thread(run_whisper, float_audio)
+                if text and len(text) > 2:
+                    print("partial textnnnnnnnnnnnnnnnnnnnnnn",text)
+                    # throttle partials a bit to avoid flooding
+                    now = time.time()
+                    if text != self._last_partial_text or (now - self._last_partial_ts) > 0.8:
+                        self._last_partial_text = text
+                        self._last_partial_ts = now
+                        # await self.buffer_queue.put({"type":"asr_partial", "text": text})
+                        await self.send(json.dumps({"event":"asr_partial", "text": text}))
+            except Exception as e:
+                print("Partial transcribe error:", e)
+
+    async def _transcribe_final_and_queue(self, pcm_bytes: bytes):
+        """Transcribe final utterance and put into buffer_queue as asr_final."""
+        async with self._transcribe_lock:
+            try:
+                if len(pcm_bytes) < int(SAMPLE_RATE * 0.3 * 2):
+                    print("⚠️ PCM chunk too small for final transcription")
+                    return
+                int16 = pcm16_to_int16_arr(pcm_bytes)
+                float_audio = int16_to_float32(int16)
+                if self.sample_rate != 16000:
+                    # float_audio = await asyncio.to_thread(librosa.resample, float_audio, self.sample_rate, 16000)
+                    float_audio = await asyncio.to_thread(resample_audio_float32, float_audio, self.sample_rate, 16000)
+
+                def run_whisper(audio_arr):
+                    segments, _ = whisper_model.transcribe(audio_arr, language="en", beam_size=5)
+                    return " ".join([seg.text for seg in segments]).strip()
+
+                text = await asyncio.to_thread(run_whisper, float_audio)
+                if text and len(text) > 2:
+                    print("FInal text 77777777777777777777777777777777777777777")
+                    await self.buffer_queue.put({"type":"asr_final", "text": text})
+                    await self.send(json.dumps({"event":"asr_final", "text": text}))
                 else:
-                    # partial result available via PartialResult() — not using for now
-                    pass
-
-            return
-
-        if event == 'stop':
-            print("Stream stopped by Twilio")
-            # finish
-            if self.processing_task:
-                self.processing_task.cancel()
-            return
-
-        #for testing only
-        # if event == "asr_text":
-        #     user_text = data.get("text", "")
-        #     print("👂 User said:", user_text)
-
-        #     # Call Azure OpenAI to generate AI reply
-        #     try:
-        #         completion = client.chat.completions.create(
-        #             model="gpt-4o-mini",
-        #             messages=[
-        #                 {"role": "system", "content": "You are a friendly AI voice agent helping customers."},
-        #                 {"role": "user", "content": user_text}
-        #             ]
-        #         )
-        #         ai_reply = completion.choices[0].message.content
-        #     except Exception as e:
-        #         ai_reply = f"Sorry, AI service error: {e}"
-
-        #     # Send AI text response back
-        #     await self.send(json.dumps({
-        #         "event": "ai_text",
-        #         "ai_text": ai_reply
-        #     }))
-
+                    print("No final transcription produced")
+                    await self.buffer_queue.put({"type": "asr_final", "text": "Sorry, I didn't hear anything."})
+                    await self.stream_tts_to_twilio("I didn't hear anything. Could you repeat?")
+            except Exception as e:
+                print("Final transcribe error:", e)
 
     async def process_queue(self):
-        """
-        Background worker: consumes recognized texts, calls bot logic, synthesizes TTS, streams audio back.
-        """
-        try:
-            print("in process queue,,,,,,,,,,,,,,,,,,,,,,,")
-            while True:
+        """Consume final ASR results, call AI and stream TTS back to Twilio."""
+        while True:
+            try:
+                print("In the process queue..........................")
                 item = await self.buffer_queue.get()
-                if item['type'] == 'asr_final':
-                    user_text = item['text']
-                    # run simple bot logic
-                    reply_text = self.generate_reply(user_text)
-                    print(f"Bot reply: {reply_text}")
-                    # synthesize reply_text to audio (mp3/wav) and stream back
-                    await self.stream_tts_to_twilio(reply_text)
-        except asyncio.CancelledError:
-            print("Erroororoor")
-            pass
+                if item["type"] == "asr_final":
+                    user_text = item["text"]
+                    print("ASR final =>", user_text)
+                    # generate reply (can be heavy; keep in thread if needed inside)
+                    reply = await self.generate_reply(user_text)
+                    await self.stream_tts_to_twilio(reply)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print("process_queue error:", e)
+                await asyncio.sleep(0.1)
 
-    async def generate_reply(self, user_text):
-        """
-        Generate a conversational reply using Azure OpenAI.
-        """
-        completion = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": "You are a friendly outbound voice assistant. Keep replies under 20 words."},
-                {"role": "user", "content": user_text}
-            ]
-        )
-        return completion.choices[0].message.content.strip()
+    async def generate_reply(self, user_text: str) -> str:
+        """Call OpenAI (or local LLM) — keep it reasonably short."""
+        try:
+            print("In generate 4444444444444444444444444444444444")
+            relevant_docs = [d if isinstance(d, str) else d[0] for d in search_similar_docs(user_text, top_k=2)]
+            context = "\n".join(relevant_docs)
+            print("context",context)
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":"You are a concise friendly voice assistant."},
+                    {"role":"system","content":f"Company data:\n{context}"},
+                    {"role":"user","content":user_text}
+                ],
+                temperature=0.3
+            )
+            reply = completion.choices[0].message.content.strip()
+            print(reply,"rrrrrrrrrrrrrrrreeeeeeeeeeeeeeppppppppp")
+            return reply
+        except Exception as e:
+            print("AI error:", e)
+            return "Sorry — I didn't catch that."
 
-    async def stream_tts_to_twilio(self, text):
-        """
-        Synthesize `text` to audio, convert to 8kHz PCM16 mono, chunk into frames and send them back as Twilio 'media' messages.
-        Twilio expects the audio payload to be raw PCM16LE at 8kHz for telephony - we will convert.
-        """
-        # 1) Synthesize using gTTS -> MP3 in-memory
-        tts = gTTS(text=text, lang='en')
-        mp3_buf = io.BytesIO()
-        tts.write_to_fp(mp3_buf)
-        mp3_buf.seek(0)
+    async def stream_tts_to_twilio(self, text: str):
+        """Synthesize text to audio, downsample to 8kHz PCM16, and stream back chunked to Twilio."""
+        try:
+            print("Final stram to tttsmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",text)
+            # synthesize MP3 via gTTS in thread
+            def gen_mp3(t):
+                buf = io.BytesIO()
+                gTTS(text=t, lang="en").write_to_fp(buf)
+                buf.seek(0)
+                return buf.read()
+            mp3_bytes = await asyncio.to_thread(gen_mp3, text)
+            mp3_buf = io.BytesIO(mp3_bytes)
 
-        data, sr = sf.read(mp3_buf, dtype='int16')
-        if sr != 8000:
-            # downsample manually to 8kHz
-            import librosa
-            data = librosa.resample(data.astype(float), orig_sr=sr, target_sr=8000)
-            data = (data * 32767).astype(np.int16)
+            # read mp3 to float array
+            data, sr = sf.read(mp3_buf, dtype="float32")
+            if data.ndim > 1:
+                data = np.mean(data, axis=1)  # Convert to mono
+            else:
+                data = data.flatten()
+            if sr != SAMPLE_RATE:
+                # data = await asyncio.to_thread(librosa.resample, data, sr, SAMPLE_RATE)
+                data = await asyncio.to_thread(resample_audio_float32, data, sr, SAMPLE_RATE)
+                
+            pcm_int16 = (data * 32767).astype(np.int16)
+            pcm_bytes = pcm_int16.tobytes()
 
-        pcm_bytes = data.tobytes()
+            # send in small real-time chunks (~100ms)
+            chunk_size = int(BYTES_PER_SEC * 0.1)  # 0.1s
+            for i in range(0, len(pcm_bytes), chunk_size):
+                chunk = pcm_bytes[i:i+chunk_size]
+                if not chunk:
+                    continue
+                msg = {"event":"media","streamSid": self.stream_sid,"track": "outbound","media":{"payload": base64.b64encode(chunk).decode('ascii')}}
+                # await self.send(text_data=json.dumps(msg))
+                await self.safe_send(msg)
+                await asyncio.sleep(0.02)
+            # send mark
+            # await self.send(text_data=json.dumps({"event":"mark","streamSid": self.stream_sid,"mark":{"name":"tts_end"}}))
+            await self.send(text_data=json.dumps({"event":"mark","streamSid": self.stream_sid,"mark":{"name":"tts_end"}}))
+            print("All done 444444444444444444444444444444444444444444444444444")
+        except Exception as e:
+            print("TTS error:", e)
 
-        # 3) Twilio expects small frames — we'll send 3200-byte frames (~200ms @8kHz*2bytes = 16000bytes per second; so chunk e.g. 3200 = 0.2s)
-        chunk_size = 3200
-        for i in range(0, len(pcm_bytes), chunk_size):
-            chunk = pcm_bytes[i:i+chunk_size]
-            if not chunk:
-                continue
-            b64 = base64.b64encode(chunk).decode('ascii')
-            msg = {
-                "event": "media",
-                "media": {
-                    "payload": b64
-                }
-            }
-            await self.send(text_data=json.dumps(msg))
-            # small sleep to simulate streaming rate to Twilio (keep close to real-time)
-            await asyncio.sleep(0.18)
-        # Optionally send a "mark" event when done playing (Twilio supports mark messages for bidirectional streams)
-        mark_msg = {"event": "mark", "mark": {"name": "tts_end"}}
-        await self.send(text_data=json.dumps(mark_msg))
+    async def safe_send(self, message: dict):
+        """Send safely — skip if websocket already closed."""
+        try:
+            await self.send(text_data=json.dumps(message))
+        except Exception as e:
+            print("⚠️ safe_send error:", e)
